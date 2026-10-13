@@ -59,6 +59,21 @@ def claim(conn):
     ).fetchone()
 
 
+def lease_expired(conn):
+    """True if any SENDING row has outlived its lease: its owner is not going to report back."""
+    count = conn.execute(
+        "SELECT count(*) FROM actions WHERE status = 'SENDING' AND attempted_at < now() - %s * interval '1 second'",
+        (LEASE_SECONDS,),
+    ).fetchone()[0]
+    return count > 0
+
+
+def all_done(conn):
+    """True once every row is SENT or FAILED."""
+    remaining = conn.execute("SELECT count(*) FROM actions WHERE status NOT IN ('SENT', 'FAILED')").fetchone()[0]
+    return remaining == 0
+
+
 def send(action_id, recipient, body):
     """POST /send. Returns the receipt_id, or raises."""
     data = json.dumps({"action_id": action_id, "recipient": recipient, "body": body}).encode()
@@ -104,18 +119,13 @@ def settle(conn):
 def main():
     with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
         while True:
-            expired = conn.execute(
-                "SELECT count(*) FROM actions WHERE status = 'SENDING' AND attempted_at < now() - %s * interval '1 second'",
-                (LEASE_SECONDS,),
-            ).fetchone()[0]
-            if expired > 0:
+            if lease_expired(conn):
                 settle(conn)
 
             wait_for_slot(conn)
             row = claim(conn)
             if row is None:
-                remaining = conn.execute("SELECT count(*) FROM actions WHERE status NOT IN ('SENT', 'FAILED')").fetchone()[0]
-                if remaining == 0:
+                if all_done(conn):
                     print("nothing left to do")
                     return
                 time.sleep(1)  # other workers are mid-send, or rows are waiting out their lease
@@ -124,8 +134,6 @@ def main():
             action_id, recipient, body = row
             try:
                 receipt_id = send(action_id, recipient, body)
-                # "AND status = 'SENDING'" on every outcome update: only the worker holding the row
-                # may move it, and settle() may already have moved it to SENT in the meantime
                 conn.execute(
                     "UPDATE actions SET status = 'SENT', receipt_id = %s WHERE id = %s AND status = 'SENDING'",
                     (receipt_id, action_id),
@@ -148,8 +156,6 @@ def main():
                     )
                     print(f"{action_id} FAILED {reason}")
             except OSError as e:
-                # timeout or connection reset (all OSError subclasses): the provider may well have sent it,
-                # so we must not resend. Leave the row SENDING; when its lease runs out, settle() asks the provider.
                 print(f"{action_id} NO ANSWER ({type(e).__name__}), settle() will check /sent after the lease")
 
 
