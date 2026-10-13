@@ -11,6 +11,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://dispatch:dispatch@12
 PROVIDER_URL = os.environ.get("PROVIDER_URL", "http://127.0.0.1:8080")
 HTTP_TIMEOUT = 3  # seconds; provider latency is 20-120 ms, a hang would otherwise block for minutes
 SEND_INTERVAL = 0.1  # seconds between requests across ALL workers: 10/s, under the provider's 12/s
+LEASE_SECONDS = 10
 
 
 def wait_for_slot(conn):
@@ -66,33 +67,90 @@ def send(action_id, recipient, body):
         return json.load(resp)["receipt_id"]
 
 
+def settle(conn):
+    """Settle SENDING rows whose owner never reported back.
+
+    Read the provider's /sent list from where we left off and mark everything we find as SENT.
+    Any row still SENDING past its lease after that was never recorded by the provider, so it
+    goes back to PENDING and will be sent again.
+    """
+    while True:
+        wait_for_slot(conn)  # /sent shares the provider's rate limit with /send
+        cursor = conn.execute("SELECT sent_cursor FROM provider_state").fetchone()[0]
+        try:
+            with urllib.request.urlopen(f"{PROVIDER_URL}/sent?since={cursor}", timeout=HTTP_TIMEOUT) as resp:
+                page = json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                block_everyone(conn, int(e.headers["Retry-After"]))
+            continue  # 429 or 500: ask for the same page again
+
+        for receipt in page["receipts"]:
+            conn.execute(
+                "UPDATE actions SET status = 'SENT', receipt_id = %s WHERE id = %s AND status <> 'SENT'",
+                (receipt["receipt_id"], receipt["action_id"]),
+            )
+        conn.execute("UPDATE provider_state SET sent_cursor = %s", (page["next"],))
+        if not page["receipts"]:
+            break  # end of the list for now
+
+    resent = conn.execute(
+        "UPDATE actions SET status = 'PENDING' WHERE status = 'SENDING' AND attempted_at < now() - %s * interval '1 second'",
+        (LEASE_SECONDS,),
+    ).rowcount
+    print(f"settled: {resent} row(s) were never sent, back to PENDING")
+
+
 def main():
     with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
         while True:
+            expired = conn.execute(
+                "SELECT count(*) FROM actions WHERE status = 'SENDING' AND attempted_at < now() - %s * interval '1 second'",
+                (LEASE_SECONDS,),
+            ).fetchone()[0]
+            if expired > 0:
+                settle(conn)
+
             wait_for_slot(conn)
             row = claim(conn)
             if row is None:
-                print("nothing left to do")
-                return
+                remaining = conn.execute("SELECT count(*) FROM actions WHERE status NOT IN ('SENT', 'FAILED')").fetchone()[0]
+                if remaining == 0:
+                    print("nothing left to do")
+                    return
+                time.sleep(1)  # other workers are mid-send, or rows are waiting out their lease
+                continue
+
             action_id, recipient, body = row
             try:
                 receipt_id = send(action_id, recipient, body)
-                conn.execute("UPDATE actions SET status = 'SENT', receipt_id = %s WHERE id = %s", (receipt_id, action_id))
+                # "AND status = 'SENDING'" on every outcome update: only the worker holding the row
+                # may move it, and settle() may already have moved it to SENT in the meantime
+                conn.execute(
+                    "UPDATE actions SET status = 'SENT', receipt_id = %s WHERE id = %s AND status = 'SENDING'",
+                    (receipt_id, action_id),
+                )
                 print(f"{action_id} SENT {receipt_id}")
-            except Exception as e:
-                if isinstance(e, urllib.error.HTTPError) and e.code in (429, 500):
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500):
                     # nothing was sent in either case, so retrying is safe
-                    conn.execute("UPDATE actions SET status = 'PENDING' WHERE id = %s", (action_id,))
+                    conn.execute("UPDATE actions SET status = 'PENDING' WHERE id = %s AND status = 'SENDING'", (action_id,))
                     print(f"{action_id} RETRY after {e.code}")
                     if e.code == 429:
                         # provider opened a Retry-After window; any request inside it is a violation
                         block_everyone(conn, int(e.headers["Retry-After"]))
-                    continue
-
-                # everything else is not handled yet: record what happened and move on
-                reason = f"{type(e).__name__}: {e}"
-                conn.execute("UPDATE actions SET status = 'FAILED', fail_reason = %s WHERE id = %s", (reason, action_id))
-                print(f"{action_id} FAILED {reason}")
+                else:
+                    # any other HTTP error (400) will not get better with a retry
+                    reason = f"HTTP {e.code}"
+                    conn.execute(
+                        "UPDATE actions SET status = 'FAILED', fail_reason = %s WHERE id = %s AND status = 'SENDING'",
+                        (reason, action_id),
+                    )
+                    print(f"{action_id} FAILED {reason}")
+            except OSError as e:
+                # timeout or connection reset (all OSError subclasses): the provider may well have sent it,
+                # so we must not resend. Leave the row SENDING; when its lease runs out, settle() asks the provider.
+                print(f"{action_id} NO ANSWER ({type(e).__name__}), settle() will check /sent after the lease")
 
 
 if __name__ == "__main__":
