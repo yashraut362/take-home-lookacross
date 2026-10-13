@@ -1,6 +1,7 @@
 """Drain PENDING actions and send them through the provider."""
 import json
 import os
+import urllib.error
 import urllib.request
 
 import psycopg
@@ -43,7 +44,14 @@ def main():
                 receipt_id = send(action_id, recipient, body)
                 conn.execute("UPDATE actions SET status = 'SENT', receipt_id = %s WHERE id = %s", (receipt_id, action_id))
                 print(f"{action_id} SENT {receipt_id}")
-            except Exception as e:  # no fault handling yet: record what happened and move on
+            except Exception as e:
+                if isinstance(e, urllib.error.HTTPError) and e.code == 500:
+                    # provider says nothing was sent, so retrying is safe
+                    conn.execute("UPDATE actions SET status = 'PENDING' WHERE id = %s", (action_id,))
+                    print(f"{action_id} RETRY after 500")
+                    continue
+
+                # everything else is not handled yet: record what happened and move on
                 reason = f"{type(e).__name__}: {e}"
                 conn.execute("UPDATE actions SET status = 'FAILED', fail_reason = %s WHERE id = %s", (reason, action_id))
                 print(f"{action_id} FAILED {reason}")
